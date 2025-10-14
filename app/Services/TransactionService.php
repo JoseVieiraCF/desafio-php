@@ -92,7 +92,7 @@ class TransactionService
             if ($fromUserId === $toUserId) $toUserId = null;
 
             
-            $ids = array_filter([$fromUserId, $toUserId]);
+            $ids = [$fromUserId, $toUserId];
             sort($ids);
             $this->getOrCreateWalletLocked($ids[0]);
             if(isset($ids[1])) $this->getOrCreateWalletLocked($ids[1]);
