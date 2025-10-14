@@ -56,7 +56,7 @@ class TransactionService
             if ($idempotencyKey) {
                 if ($existing = $this->getExistingTransaction($idempotencyKey)) return $existing;
             }
-            [$fromWallet, $toWallet] = $this->lockWalletsDeterministically($from, $toUser);
+            [$fromWallet, $toWallet] = $this->lockWalletsDeterministically($from->id, $toUser->id);
             
             if ($fromWallet->balance_cents < $amountCents) {
                 throw new InsufficientFundsException('Saldo insuficiente para transferência!');
@@ -82,51 +82,23 @@ class TransactionService
     public function reverseTransaction(int $transactionId, User $actor): Transaction
     {
         return DB::transaction(function () use ($transactionId, $actor) {
-            $tx = Transaction::where('id', $transactionId)->lockForUpdate()->firstOrFail();
-            if ($tx->status === 'reversed') throw new AlreadyReversedException();
+            $originalTx = Transaction::where('id', $transactionId)
+                ->lockForUpdate()
+                ->firstOrFail();
 
-            $fromUserId = $tx->to_user_id;
-            $toUserId = $tx->from_user_id;
-            $amount = $tx->amount_cents;
-
-            if ($fromUserId === $toUserId) $toUserId = null;
-
-            
-            $ids = [$fromUserId, $toUserId];
-            sort($ids);
-            $this->getOrCreateWalletLocked($ids[0]);
-            if(isset($ids[1])) $this->getOrCreateWalletLocked($ids[1]);
-
-            $fromWallet = Wallet::where('user_id', $fromUserId)->first();
-            $toWallet = Wallet::where('user_id', $toUserId)->first();
-
-            if ($fromWallet) {
-                if($fromWallet->balance_cents < $amount) {
-                    throw new InsufficientFundsException('Saldo insufieciente para estornar a transação!');
-                }
-                $this->updateBalance($fromWallet, -$amount);
-            }
-            if ($toWallet) {
-                $this->updateBalance($toWallet, $amount);
-            }
-
-            $rev = Transaction::create([
-                'uuid' => Str::uuid(),
-                'type' => 'reversal',
-                'amount_cents' => $amount,
-                'from_user_id' => $fromUserId,
-                'to_user_id' => $toUserId,
-                'status' => 'completed',
-                'reversed_transaction_id' => $tx->id,
-                'metadata' => ['reversed_by' => $actor->id],
-            ]);
-
-            $tx->status = 'reversed';
-            $tx->save();
-
-            return $rev;
+            $this->ensureNotAlreadyReversed($originalTx);
+            [$fromUserId, $toUserId, $amount] = $this->extractReversalDetails($originalTx);
+            [$fromWallet, $toWallet] = $this->lockWalletsDeterministically($fromUserId, $toUserId);
+            $this->processReversalBalances($fromWallet, $toWallet, $amount);
+            $reversal = $this->createReversalTransaction($originalTx, $actor, $amount, $fromUserId, $toUserId);
+            $this->markTransactionAsReversed($originalTx);
+            return $reversal;
         });
     }
+
+
+    
+
 
     private function getOrCreateWalletLocked(int $userId): Wallet
     {
@@ -153,16 +125,77 @@ class TransactionService
             : null;
     }
 
-    private function lockWalletsDeterministically(User $from, User $toUser): array {
-        [$firstId, $secondId] = [$from->id, $toUser->id];
-        if ($firstId > $secondId) {
-            [$firstId, $secondId] = [$secondId, $firstId];
-        }
-        $w1 = Wallet::where('user_id', $firstId)->lockForUpdate()->first() ?? Wallet::create(['user_id' => $firstId, 'balance_cents' => 0]);
-        $w2 = Wallet::where('user_id', $secondId)->lockForUpdate()->first() ?? Wallet::create(['user_id' => $secondId, 'balance_cents' => 0]);
+    private function lockWalletsDeterministically(?int $fromUserId, ?int $toUserId): array
+    {
+        $ids = array_filter([$fromUserId, $toUserId]);
+        sort($ids);
 
-        $fromWallet = $from->id === $w1->user_id ? $w1 : $w2;
-        $toWallet = $toUser->id === $w1->user_id ? $w1 : $w2;
+        foreach ($ids as $id) {
+            $this->getOrCreateWalletLocked($id);
+        }
+
+        $fromWallet = $fromUserId ? Wallet::where('user_id', $fromUserId)->lockForUpdate()->first() : null;
+        $toWallet = $toUserId ? Wallet::where('user_id', $toUserId)->lockForUpdate()->first() : null;
+
         return [$fromWallet, $toWallet];
+    }
+
+    private function extractReversalDetails(Transaction $tx): array
+    {
+        $fromUserId = $tx->to_user_id;
+        $toUserId = $tx->from_user_id;
+        $amount = $tx->amount_cents;
+
+        if ($fromUserId === $toUserId) {
+            $toUserId = null;
+        }
+
+        return [$fromUserId, $toUserId, $amount];
+}
+
+    private function ensureNotAlreadyReversed(Transaction $tx): void
+    {
+        if ($tx->status === 'reversed') {
+            throw new AlreadyReversedException('Transação já foi estornada.');
+        }
+    }
+
+    private function processReversalBalances(?Wallet $fromWallet, ?Wallet $toWallet, int $amount): void
+    {
+        if ($fromWallet) {
+            if ($fromWallet->balance_cents < $amount) {
+                throw new InsufficientFundsException('Saldo insuficiente para estornar a transação!');
+            }
+
+            $this->updateBalance($fromWallet, -$amount);
+        }
+
+        if ($toWallet) {
+            $this->updateBalance($toWallet, $amount);
+        }
+    }
+
+    private function createReversalTransaction(
+        Transaction $originalTx,
+        User $actor,
+        int $amount,
+        ?int $fromUserId,
+        ?int $toUserId
+    ): Transaction {
+        return Transaction::create([
+            'uuid' => Str::uuid(),
+            'type' => 'reversal',
+            'amount_cents' => $amount,
+            'from_user_id' => $fromUserId,
+            'to_user_id' => $toUserId,
+            'status' => 'completed',
+            'reversed_transaction_id' => $originalTx->id,
+            'metadata' => ['reversed_by' => $actor->id],
+        ]);
+    }
+
+    private function markTransactionAsReversed(Transaction $tx): void
+    {
+        $tx->update(['status' => 'reversed']);
     }
 }
